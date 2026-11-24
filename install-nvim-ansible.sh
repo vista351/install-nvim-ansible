@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 
 set -Eeuo pipefail
@@ -10,7 +9,7 @@ set -Eeuo pipefail
 # Versions are pinned
 # ============================================================
 
-trap 'echo "ERROR: Installation failed at line $LINENO"; exit 1' ERR
+trap 'rc=$?; echo "ERROR: Installation failed at line $LINENO (exit code: $rc)"; exit "$rc"' ERR
 
 # ------------------------------------------------------------
 # 0. Version lock
@@ -297,6 +296,26 @@ else
 
 fi
 
+# Verify the initial checkout.
+
+LAZY_TAG_COMMIT="$(
+    git -C "$LAZY_DIR" rev-parse "refs/tags/${LAZY_VERSION}^{commit}"
+)"
+
+LAZY_HEAD_COMMIT="$(
+    git -C "$LAZY_DIR" rev-parse HEAD
+)"
+
+if [[ "$LAZY_HEAD_COMMIT" != "$LAZY_TAG_COMMIT" ]]; then
+    echo "ERROR: Initial lazy.nvim commit verification failed."
+    echo "Expected: $LAZY_TAG_COMMIT"
+    echo "Installed: $LAZY_HEAD_COMMIT"
+    exit 1
+fi
+
+echo "Initial lazy.nvim version: $LAZY_VERSION"
+echo "Commit: ${LAZY_HEAD_COMMIT:0:7}"
+
 # ------------------------------------------------------------
 # 8. Create init.lua
 # ------------------------------------------------------------
@@ -393,7 +412,7 @@ local lazypath = vim.fn.stdpath("data") .. "/lazy/lazy.nvim"
 
 if not vim.uv.fs_stat(lazypath) then
 
-    error("lazy.nvim is missing. Run install.sh again.")
+    error("lazy.nvim is missing. Run install-nvim-ansible.sh again.")
 
 end
 
@@ -617,7 +636,39 @@ echo "[8/9] Installing Neovim plugins..."
 
 nvim --headless "+Lazy! sync" +qa
 
-# Verify that the lock file has been generated.
+# ------------------------------------------------------------
+# Restore pinned lazy.nvim version
+# ------------------------------------------------------------
+
+# Lazy sync may update lazy.nvim itself.
+# Restore the exact release tag after synchronization.
+
+echo
+echo "Restoring lazy.nvim version: $LAZY_VERSION"
+
+git -C "$LAZY_DIR" checkout --detach "$LAZY_VERSION"
+
+LAZY_TAG_COMMIT="$(
+    git -C "$LAZY_DIR" rev-parse "refs/tags/${LAZY_VERSION}^{commit}"
+)"
+
+LAZY_HEAD_COMMIT="$(
+    git -C "$LAZY_DIR" rev-parse HEAD
+)"
+
+if [[ "$LAZY_HEAD_COMMIT" != "$LAZY_TAG_COMMIT" ]]; then
+    echo "ERROR: lazy.nvim commit verification failed."
+    echo "Expected: $LAZY_TAG_COMMIT"
+    echo "Installed: $LAZY_HEAD_COMMIT"
+    exit 1
+fi
+
+echo "lazy.nvim version restored: $LAZY_VERSION"
+echo "Commit: ${LAZY_HEAD_COMMIT:0:7}"
+
+# ------------------------------------------------------------
+# Verify plugin lock file
+# ------------------------------------------------------------
 
 if [[ ! -s "$NVIM_CONFIG/lazy-lock.json" ]]; then
     echo "ERROR: lazy-lock.json was not generated."
@@ -627,6 +678,10 @@ fi
 echo
 echo "Plugin lock file:"
 echo "$NVIM_CONFIG/lazy-lock.json"
+
+# ------------------------------------------------------------
+# Install missing Tree-sitter parsers
+# ------------------------------------------------------------
 
 echo
 echo "Checking Tree-sitter parsers..."
@@ -653,7 +708,9 @@ nvim --headless \
         end" \
     -c "qa"
 
-# Verify required parsers.
+# ------------------------------------------------------------
+# Verify required Tree-sitter parsers
+# ------------------------------------------------------------
 
 nvim --headless \
     -c "lua \
@@ -702,6 +759,10 @@ echo "Ansible Language Server:"
 command -v ansible-language-server
 
 echo
+echo "Prettier:"
+prettier --version
+
+echo
 echo "Ansible Lint:"
 ansible-lint --version
 
@@ -709,9 +770,12 @@ echo
 echo "Yamllint:"
 yamllint --version
 
+# ------------------------------------------------------------
+# Verify lazy.nvim version, tag and commit
+# ------------------------------------------------------------
+
 echo
-echo "Prettier:"
-prettier --version
+echo "lazy.nvim:"
 
 echo
 echo "lazy.nvim:"
@@ -721,21 +785,41 @@ LAZY_VERSION_INSTALLED="$(
     "$LAZY_DIR/lua/lazy/core/config.lua"
 )"
 
-LAZY_COMMIT="$(git -C "$LAZY_DIR" rev-parse --short HEAD)"
+LAZY_TAG_COMMIT="$(
+    git -C "$LAZY_DIR" rev-parse "refs/tags/${LAZY_VERSION}^{commit}"
+)"
+
+LAZY_HEAD_COMMIT="$(
+    git -C "$LAZY_DIR" rev-parse HEAD
+)"
 
 echo "Version: $LAZY_VERSION_INSTALLED"
-echo "Commit: $LAZY_COMMIT"
+echo "Expected tag: $LAZY_VERSION"
+echo "Commit: ${LAZY_HEAD_COMMIT:0:7}"
 
-if [[ "$LAZY_VERSION_INSTALLED" != "$LAZY_VERSION" ]]; then
+if [[ "$LAZY_VERSION_INSTALLED" != "${LAZY_VERSION#v}" ]]; then
     echo "ERROR: lazy.nvim version mismatch."
-    echo "Expected: $LAZY_VERSION"
-    echo "Installed: $LAZY_VERSION_INSTALLED"
     exit 1
 fi
+
+if [[ "$LAZY_HEAD_COMMIT" != "$LAZY_TAG_COMMIT" ]]; then
+    echo "ERROR: lazy.nvim commit does not match pinned release."
+    exit 1
+fi
+
+echo "lazy.nvim verification successful."
+
+# ------------------------------------------------------------
+# Verify plugin lock file
+# ------------------------------------------------------------
 
 echo
 echo "Plugin lock file:"
 ls -lh "$NVIM_CONFIG/lazy-lock.json"
+
+# ------------------------------------------------------------
+# Installation completed
+# ------------------------------------------------------------
 
 echo
 echo "Installation completed successfully."
@@ -757,4 +841,3 @@ echo "  $NVIM_CONFIG/init.lua"
 echo
 echo "Plugin versions:"
 echo "  $NVIM_CONFIG/lazy-lock.json"
-
