@@ -715,7 +715,23 @@ prettier --version
 
 echo
 echo "lazy.nvim:"
-git -C "$LAZY_DIR" describe --tags --exact-match
+
+LAZY_VERSION_INSTALLED="$(
+    grep -oP 'M\.version\s*=\s*"\K[^"]+' \
+    "$LAZY_DIR/lua/lazy/core/config.lua"
+)"
+
+LAZY_COMMIT="$(git -C "$LAZY_DIR" rev-parse --short HEAD)"
+
+echo "Version: $LAZY_VERSION_INSTALLED"
+echo "Commit: $LAZY_COMMIT"
+
+if [[ "$LAZY_VERSION_INSTALLED" != "$LAZY_VERSION" ]]; then
+    echo "ERROR: lazy.nvim version mismatch."
+    echo "Expected: $LAZY_VERSION"
+    echo "Installed: $LAZY_VERSION_INSTALLED"
+    exit 1
+fi
 
 echo
 echo "Plugin lock file:"
