@@ -1,90 +1,103 @@
 
 #!/usr/bin/env bash
+
 set -Eeuo pipefail
 
 # ============================================================
 # Neovim YAML / Ansible IDE installer
-#
-# OS: Ubuntu 24.04
-# Architecture: x86_64
-# User: regular Linux user (not root)
-#
-# Existing Ansible Core is preserved.
+# OS: Ubuntu 24.04 x86_64
+# Existing Ansible Core is preserved
+# Versions are pinned
 # ============================================================
 
-readonly CONFIG_DIR="${HOME}/.config/nvim"
-readonly DATA_DIR="${HOME}/.local/share/nvim"
-readonly STATE_DIR="${HOME}/.local/state/nvim"
+trap 'echo "ERROR: Installation failed at line $LINENO"; exit 1' ERR
 
-log() {
-    echo -e "\n[INFO] $*"
-}
+# ------------------------------------------------------------
+# 0. Version lock
+# ------------------------------------------------------------
 
-warn() {
-    echo -e "\n[WARN] $*" >&2
-}
+NVIM_VERSION="0.11.7"
+NODE_VERSION="26.13.1"
+LAZY_VERSION="v11.17.5"
 
-die() {
-    echo -e "\n[ERROR] $*" >&2
+YAML_LS_VERSION="2.0.0"
+ANSIBLE_LS_VERSION="26.6.0"
+PRETTIER_VERSION="3.10.1"
+
+ANSIBLE_LINT_VERSION="26.11.0"
+YAMLLINT_VERSION="1.38.0"
+
+LSPCONFIG_TAG="v2.12.0"
+CONFORM_TAG="v9.1.0"
+
+echo "Pinned versions:"
+echo "Neovim: $NVIM_VERSION"
+echo "Node.js: $NODE_VERSION"
+echo "lazy.nvim: $LAZY_VERSION"
+echo "YAML LS: $YAML_LS_VERSION"
+echo "Ansible LS: $ANSIBLE_LS_VERSION"
+echo "Prettier: $PRETTIER_VERSION"
+echo "ansible-lint: $ANSIBLE_LINT_VERSION"
+echo "yamllint: $YAMLLINT_VERSION"
+
+# ------------------------------------------------------------
+# 1. Basic checks
+# ------------------------------------------------------------
+
+if [[ "$EUID" -eq 0 ]]; then
+    echo "Run this script as a regular user, not root."
     exit 1
-}
+fi
 
-# ------------------------------------------------------------
-# 1. Environment checks
-# ------------------------------------------------------------
-
-[[ "$EUID" -ne 0 ]] || die "Run as a regular user, not root."
-
-[[ -f /etc/os-release ]] || die "Cannot detect OS."
+if [[ ! -f /etc/os-release ]]; then
+    echo "Cannot determine operating system."
+    exit 1
+fi
 
 source /etc/os-release
 
-[[ "$ID" == "ubuntu" && "$VERSION_ID" == "24.04" ]] \
-    || die "Ubuntu 24.04 is required."
-
-[[ "$(uname -m)" == "x86_64" ]] \
-    || die "Only x86_64 is supported."
-
-command -v sudo >/dev/null 2>&1 \
-    || die "sudo is required."
-
-log "Environment check passed."
-
-# ------------------------------------------------------------
-# 2. Check existing Ansible Core
-# ------------------------------------------------------------
-
-log "Checking existing Ansible installation..."
-
-command -v ansible >/dev/null 2>&1 \
-    || die "Ansible Core is not installed."
-
-ANSIBLE_VERSION="$(
-    ansible --version |
-    sed -n '1s/.*core \([0-9.]*\).*/\1/p'
-)"
-
-[[ -n "$ANSIBLE_VERSION" ]] \
-    || die "Cannot detect Ansible Core version."
-
-if ! python3 - "$ANSIBLE_VERSION" <<'PY'
-import sys
-
-version = tuple(map(int, sys.argv[1].split(".")))
-sys.exit(0 if version >= (2, 9) else 1)
-PY
-then
-    die "Ansible Core 2.9 or newer is required."
+if [[ "$ID" != "ubuntu" || "$VERSION_ID" != "24.04" ]]; then
+    echo "This script supports Ubuntu 24.04 only."
+    exit 1
 fi
 
-echo "Detected Ansible Core: ${ANSIBLE_VERSION}"
-ansible --version | head -n 5
+if [[ "$(dpkg --print-architecture)" != "amd64" ]]; then
+    echo "This script supports amd64 architecture only."
+    exit 1
+fi
+
+if ! command -v ansible >/dev/null 2>&1; then
+    echo "Ansible Core is not installed."
+    echo "Install Ansible Core separately."
+    exit 1
+fi
+
+ANSIBLE_BIN_BEFORE="$(command -v ansible)"
+ANSIBLE_VERSION_BEFORE="$(ansible --version | head -n 1)"
+
+echo
+echo "Existing Ansible:"
+echo "$ANSIBLE_VERSION_BEFORE"
+echo "Binary: $ANSIBLE_BIN_BEFORE"
+
+echo
+echo "Ansible Core will NOT be installed or upgraded."
+echo
+
+sudo -v
+
+TEMP_DIR="$(mktemp -d)"
+
+trap 'rm -rf "$TEMP_DIR"' EXIT
+
+export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
 
 # ------------------------------------------------------------
-# 3. Install system dependencies
+# 2. System dependencies
 # ------------------------------------------------------------
 
-log "Installing system dependencies..."
+echo
+echo "[1/9] Installing system dependencies..."
 
 sudo apt-get update
 
@@ -94,6 +107,7 @@ sudo apt-get install -y \
     git \
     unzip \
     tar \
+    xz-utils \
     gzip \
     build-essential \
     gcc \
@@ -103,217 +117,321 @@ sudo apt-get install -y \
     fd-find \
     python3 \
     python3-venv \
-    python3-pip \
     pipx \
-    yamllint \
     ca-certificates \
     gnupg
 
 # ------------------------------------------------------------
-# 4. Install Neovim stable release
+# 3. Install exact Node.js version
 # ------------------------------------------------------------
 
-log "Installing Neovim..."
+echo
+echo "[2/9] Installing Node.js $NODE_VERSION..."
 
-TMP_DIR="$(mktemp -d)"
+NODE_ARCHIVE="node-v${NODE_VERSION}-linux-x64.tar.xz"
+NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/${NODE_ARCHIVE}"
 
-cleanup() {
-    rm -rf "$TMP_DIR"
-}
+curl -fL "$NODE_URL" \
+    -o "$TEMP_DIR/$NODE_ARCHIVE"
 
-trap cleanup EXIT
+curl -fsSL \
+    "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt" \
+    -o "$TEMP_DIR/SHASUMS256.txt"
+
+grep "  ${NODE_ARCHIVE}$" \
+    "$TEMP_DIR/SHASUMS256.txt" \
+    > "$TEMP_DIR/node.sha256"
+
+if [[ ! -s "$TEMP_DIR/node.sha256" ]]; then
+    echo "Could not find Node.js archive checksum."
+    exit 1
+fi
+
+(
+    cd "$TEMP_DIR"
+    sha256sum -c node.sha256
+)
+
+NODE_DIR="/opt/node-v${NODE_VERSION}-linux-x64"
+
+sudo rm -rf "$NODE_DIR"
+
+sudo tar -xJf "$TEMP_DIR/$NODE_ARCHIVE" \
+    -C /opt
+
+sudo ln -sfn "$NODE_DIR/bin/node" /usr/local/bin/node
+sudo ln -sfn "$NODE_DIR/bin/npm" /usr/local/bin/npm
+sudo ln -sfn "$NODE_DIR/bin/npx" /usr/local/bin/npx
+
+echo "Node.js: $(node --version)"
+echo "npm: $(npm --version)"
+
+# ------------------------------------------------------------
+# 4. Install exact Neovim version
+# ------------------------------------------------------------
+
+echo
+echo "[3/9] Installing Neovim $NVIM_VERSION..."
+
+NVIM_ARCHIVE="nvim-linux-x86_64.tar.gz"
 
 curl -fL \
-    https://github.com/neovim/neovim/releases/latest/download/nvim-linux-x86_64.tar.gz \
-    -o "${TMP_DIR}/nvim.tar.gz"
+    "https://github.com/neovim/neovim/releases/download/v${NVIM_VERSION}/${NVIM_ARCHIVE}" \
+    -o "$TEMP_DIR/$NVIM_ARCHIVE"
 
-sudo tar -C /opt -xzf "${TMP_DIR}/nvim.tar.gz"
+sudo rm -rf /opt/nvim-linux-x86_64
+
+sudo tar -xzf "$TEMP_DIR/$NVIM_ARCHIVE" -C /opt
 
 sudo ln -sfn \
     /opt/nvim-linux-x86_64/bin/nvim \
     /usr/local/bin/nvim
 
-nvim --version | head -n 2
+if ! nvim --version | head -n 1 | grep -q "v${NVIM_VERSION}"; then
+    echo "Neovim version verification failed."
+    exit 1
+fi
+
+echo "Neovim: $(nvim --version | head -n 1)"
 
 # ------------------------------------------------------------
-# 5. Install Node.js 22 LTS
+# 5. Install exact language server and formatter versions
 # ------------------------------------------------------------
 
-log "Installing Node.js 22 LTS..."
+echo
+echo "[4/9] Installing language servers and formatter..."
 
-curl -fsSL \
-    https://deb.nodesource.com/setup_22.x \
-    | sudo -E bash -
+sudo npm install -g --save-exact \
+    "yaml-language-server@${YAML_LS_VERSION}" \
+    "@ansible/ansible-language-server@${ANSIBLE_LS_VERSION}" \
+    "prettier@${PRETTIER_VERSION}"
 
-sudo apt-get install -y nodejs
+echo "YAML Language Server:"
+yaml-language-server --version || true
 
-node --version
-npm --version
+echo "Ansible Language Server:"
+command -v ansible-language-server
 
-# ------------------------------------------------------------
-# 6. Install Language Servers and Prettier
-# ------------------------------------------------------------
-
-log "Installing YAML and Ansible Language Servers..."
-
-sudo npm install -g \
-    yaml-language-server \
-    @ansible/ansible-language-server \
-    prettier
-
-yaml-language-server --version
+echo "Prettier:"
 prettier --version
 
-command -v ansible-language-server \
-    || die "Ansible Language Server installation failed."
-
 # ------------------------------------------------------------
-# 7. Install ansible-lint via pipx
+# 6. Install exact Python tool versions using pipx
 # ------------------------------------------------------------
 
-log "Installing ansible-lint..."
+echo
+echo "[5/9] Installing Python tools..."
 
 pipx ensurepath
 
-export PATH="${HOME}/.local/bin:${PATH}"
+export PATH="$HOME/.local/bin:$PATH"
 
-if pipx list --short 2>/dev/null \
-    | grep -q '^ansible-lint '
-then
-    pipx upgrade ansible-lint
-else
-    pipx install ansible-lint
+# Reinstall exact pinned versions.
+# pipx environments are isolated from system Python/Ansible.
+
+if pipx list --short | grep -q '^ansible-lint '; then
+    pipx uninstall ansible-lint
 fi
 
+if pipx list --short | grep -q '^yamllint '; then
+    pipx uninstall yamllint
+fi
+
+pipx install "ansible-lint==${ANSIBLE_LINT_VERSION}"
+pipx install "yamllint==${YAMLLINT_VERSION}"
+
+echo
+echo "ansible-lint:"
 ansible-lint --version
 
+echo
+echo "yamllint:"
+yamllint --version
+
 # ------------------------------------------------------------
-# 8. Backup existing Neovim configuration
+# 7. Prepare Neovim configuration
 # ------------------------------------------------------------
 
-if [[ -d "$CONFIG_DIR" ]]; then
+echo
+echo "[6/9] Preparing Neovim configuration..."
 
-    BACKUP_DIR="${CONFIG_DIR}.backup.$(date +%Y%m%d-%H%M%S)"
+NVIM_CONFIG="$HOME/.config/nvim"
 
-    log "Backing up existing configuration..."
+mkdir -p "$NVIM_CONFIG"
 
-    mv "$CONFIG_DIR" "$BACKUP_DIR"
+# Back up only init.lua.
+# Preserve lazy-lock.json for reproducible plugin installation.
 
-    echo "Backup created: $BACKUP_DIR"
+if [[ -f "$NVIM_CONFIG/init.lua" ]]; then
+
+    BACKUP_FILE="$NVIM_CONFIG/init.lua.backup.$(date +%Y%m%d_%H%M%S)"
+
+    cp -a "$NVIM_CONFIG/init.lua" "$BACKUP_FILE"
+
+    echo "Previous init.lua backed up to:"
+    echo "$BACKUP_FILE"
+
 fi
 
-mkdir -p "$CONFIG_DIR"
+LAZY_DIR="$HOME/.local/share/nvim/lazy/lazy.nvim"
+
+mkdir -p "$(dirname "$LAZY_DIR")"
+
+# Install or checkout the exact lazy.nvim version.
+
+if [[ -d "$LAZY_DIR/.git" ]]; then
+
+    git -C "$LAZY_DIR" fetch --depth 1 origin \
+        "refs/tags/${LAZY_VERSION}:refs/tags/${LAZY_VERSION}"
+
+    git -C "$LAZY_DIR" checkout --detach "$LAZY_VERSION"
+
+else
+
+    rm -rf "$LAZY_DIR"
+
+    git clone --depth 1 \
+        --branch "$LAZY_VERSION" \
+        https://github.com/folke/lazy.nvim.git \
+        "$LAZY_DIR"
+
+fi
 
 # ------------------------------------------------------------
-# 9. Install lazy.nvim
+# 8. Create init.lua
 # ------------------------------------------------------------
 
-log "Installing lazy.nvim..."
+echo
+echo "[7/9] Creating Neovim configuration..."
 
-mkdir -p "${DATA_DIR}/lazy"
-
-git clone --filter=blob:none \
-    https://github.com/folke/lazy.nvim.git \
-    "${DATA_DIR}/lazy/lazy.nvim"
-
-# ------------------------------------------------------------
-# 10. Create Neovim configuration
-# ------------------------------------------------------------
-
-log "Creating init.lua..."
-
-cat > "${CONFIG_DIR}/init.lua" <<'LUA'
+cat > "$NVIM_CONFIG/init.lua" <<'LUA'
 
 -- ==========================================================
--- Neovim YAML / Ansible IDE
--- ==========================================================
-
--- ----------------------------------------------------------
 -- Basic settings
--- ----------------------------------------------------------
+-- ==========================================================
 
 vim.g.mapleader = " "
 vim.g.maplocalleader = " "
 
 vim.opt.number = true
 vim.opt.relativenumber = true
-
+vim.opt.mouse = "a"
+vim.opt.clipboard = "unnamedplus"
+vim.opt.termguicolors = true
 vim.opt.expandtab = true
 vim.opt.shiftwidth = 2
 vim.opt.tabstop = 2
-vim.opt.softtabstop = 2
-
 vim.opt.smartindent = true
 vim.opt.wrap = false
-
-vim.opt.ignorecase = true
-vim.opt.smartcase = true
-
-vim.opt.termguicolors = true
-vim.opt.cursorline = true
 vim.opt.signcolumn = "yes"
-
 vim.opt.updatetime = 300
-vim.opt.timeoutlen = 500
+vim.opt.completeopt = { "menu", "menuone", "noselect" }
 
-vim.opt.splitright = true
-vim.opt.splitbelow = true
+-- ==========================================================
+-- Ansible YAML filetype detection
+-- ==========================================================
 
--- ----------------------------------------------------------
--- Filetype detection
--- ----------------------------------------------------------
+local function detect_ansible_yaml(path, bufnr)
+
+    path = path:gsub("\\", "/")
+
+    local ansible_directories = {
+        "/inventory/",
+        "/group_vars/",
+        "/host_vars/",
+        "/roles/",
+        "/tasks/",
+        "/handlers/",
+        "/defaults/",
+        "/vars/",
+        "/meta/",
+        "/playbooks/",
+        "/playbook/",
+    }
+
+    for _, directory in ipairs(ansible_directories) do
+
+        if path:find(directory, 1, true) then
+            return "yaml.ansible"
+        end
+
+    end
+
+    local filename = vim.fn.fnamemodify(path, ":t")
+
+    local ansible_files = {
+        ["playbook.yml"] = true,
+        ["playbook.yaml"] = true,
+        ["site.yml"] = true,
+        ["site.yaml"] = true,
+        ["main.yml"] = true,
+        ["main.yaml"] = true,
+    }
+
+    if ansible_files[filename] then
+        return "yaml.ansible"
+    end
+
+    return nil
+
+end
 
 vim.filetype.add({
-    pattern = {
-        [".*/playbooks/.*%.ya?ml"] = "yaml.ansible",
-        [".*/roles/.*%.ya?ml"] = "yaml.ansible",
-        [".*/tasks/.*%.ya?ml"] = "yaml.ansible",
-        [".*/handlers/.*%.ya?ml"] = "yaml.ansible",
-        [".*/defaults/.*%.ya?ml"] = "yaml.ansible",
-        [".*/vars/.*%.ya?ml"] = "yaml.ansible",
-        [".*/meta/.*%.ya?ml"] = "yaml.ansible",
-        [".*/group_vars/.*%.ya?ml"] = "yaml.ansible",
-        [".*/host_vars/.*%.ya?ml"] = "yaml.ansible",
-        [".*/inventory/.*%.ya?ml"] = "yaml.ansible",
-        [".*/.*playbook.*%.ya?ml"] = "yaml.ansible",
-        [".*%.ansible%.ya?ml"] = "yaml.ansible",
+
+    extension = {
+        yml = detect_ansible_yaml,
+        yaml = detect_ansible_yaml,
     },
+
 })
 
--- ----------------------------------------------------------
--- lazy.nvim bootstrap
--- ----------------------------------------------------------
+-- ==========================================================
+-- Bootstrap lazy.nvim
+-- ==========================================================
 
-local lazypath =
-    vim.fn.stdpath("data") .. "/lazy/lazy.nvim"
+local lazypath = vim.fn.stdpath("data") .. "/lazy/lazy.nvim"
+
+if not vim.uv.fs_stat(lazypath) then
+
+    error("lazy.nvim is missing. Run install.sh again.")
+
+end
 
 vim.opt.rtp:prepend(lazypath)
 
--- ----------------------------------------------------------
+-- ==========================================================
 -- Plugins
--- ----------------------------------------------------------
+-- ==========================================================
 
 require("lazy").setup({
 
+    -- ------------------------------------------------------
+    -- LSP configurations
+    -- ------------------------------------------------------
+
     {
         "neovim/nvim-lspconfig",
+        tag = "v2.12.0",
+        lazy = false,
     },
+
+    -- ------------------------------------------------------
+    -- Tree-sitter
+    -- ------------------------------------------------------
 
     {
         "nvim-treesitter/nvim-treesitter",
         branch = "master",
-        build = ":TSUpdate",
+        lazy = false,
 
         config = function()
 
             require("nvim-treesitter.configs").setup({
 
-                ensure_installed = {
-                    "yaml",
-                    "lua",
-                    "bash",
-                    "json",
-                },
+                ensure_installed = {},
+
+                sync_install = false,
+                auto_install = false,
 
                 highlight = {
                     enable = true,
@@ -322,17 +440,20 @@ require("lazy").setup({
                 indent = {
                     enable = true,
                 },
+
             })
 
-            vim.treesitter.language.register(
-                "yaml",
-                { "yaml.ansible" }
-            )
         end,
     },
 
+    -- ------------------------------------------------------
+    -- Formatting
+    -- ------------------------------------------------------
+
     {
         "stevearc/conform.nvim",
+        tag = "v9.1.0",
+        lazy = false,
 
         config = function()
 
@@ -342,19 +463,34 @@ require("lazy").setup({
                     yaml = { "prettier" },
                 },
 
-                format_on_save = {
-                    timeout_ms = 3000,
-                    lsp_format = "never",
-                },
+                format_on_save = function(bufnr)
+
+                    if vim.bo[bufnr].filetype == "yaml" then
+
+                        return {
+                            timeout_ms = 2000,
+                            lsp_format = "never",
+                        }
+
+                    end
+
+                end,
+
             })
+
         end,
     },
 
+}, {
+
+    -- Preserve exact plugin commits between installations.
+    lockfile = vim.fn.stdpath("config") .. "/lazy-lock.json",
+
 })
 
--- ----------------------------------------------------------
+-- ==========================================================
 -- YAML Language Server
--- ----------------------------------------------------------
+-- ==========================================================
 
 vim.lsp.config("yamlls", {
 
@@ -366,28 +502,31 @@ vim.lsp.config("yamlls", {
 
         yaml = {
             validate = true,
-            hover = true,
             completion = true,
-
-            format = {
-                enable = true,
-            },
-
-            schemaStore = {
-                enable = true,
-                url = "https://www.schemastore.org/api/json/catalog.json",
-            },
+            hover = true,
         },
+
     },
+
 })
 
 vim.lsp.enable("yamlls")
 
--- ----------------------------------------------------------
+-- ==========================================================
 -- Ansible Language Server
--- ----------------------------------------------------------
+-- ==========================================================
 
 vim.lsp.config("ansiblels", {
+
+    filetypes = {
+        "yaml.ansible",
+    },
+
+    root_markers = {
+        "ansible.cfg",
+        ".ansible-lint",
+        ".git",
+    },
 
     settings = {
 
@@ -406,101 +545,57 @@ vim.lsp.config("ansiblels", {
             },
 
             validation = {
+
                 enabled = true,
 
                 lint = {
                     enabled = true,
                     path = "ansible-lint",
                 },
+
             },
+
         },
+
     },
+
 })
 
 vim.lsp.enable("ansiblels")
 
--- ----------------------------------------------------------
--- Diagnostics
--- ----------------------------------------------------------
-
-vim.diagnostic.config({
-
-    virtual_text = true,
-    signs = true,
-    underline = true,
-
-    update_in_insert = false,
-    severity_sort = true,
-
-    float = {
-        border = "rounded",
-        source = true,
-    },
-})
-
--- ----------------------------------------------------------
--- LSP key mappings
--- ----------------------------------------------------------
+-- ==========================================================
+-- LSP keymaps
+-- ==========================================================
 
 vim.api.nvim_create_autocmd("LspAttach", {
 
-    callback = function(event)
+    callback = function(args)
 
         local opts = {
-            buffer = event.buf,
+            buffer = args.buf,
             silent = true,
         }
 
-        vim.keymap.set("n", "K",
-            vim.lsp.buf.hover, opts)
+        vim.keymap.set("n", "K", vim.lsp.buf.hover, opts)
+        vim.keymap.set("n", "gd", vim.lsp.buf.definition, opts)
+        vim.keymap.set("n", "gr", vim.lsp.buf.references, opts)
+        vim.keymap.set("n", "gi", vim.lsp.buf.implementation, opts)
 
-        vim.keymap.set("n", "gd",
-            vim.lsp.buf.definition, opts)
+        vim.keymap.set("n", "<leader>rn", vim.lsp.buf.rename, opts)
+        vim.keymap.set("n", "<leader>ca", vim.lsp.buf.code_action, opts)
+        vim.keymap.set("n", "<leader>d", vim.diagnostic.open_float, opts)
 
-        vim.keymap.set("n", "gr",
-            vim.lsp.buf.references, opts)
-
-        vim.keymap.set("n", "gi",
-            vim.lsp.buf.implementation, opts)
-
-        vim.keymap.set("n", "<leader>rn",
-            vim.lsp.buf.rename, opts)
-
-        vim.keymap.set("n", "<leader>ca",
-            vim.lsp.buf.code_action, opts)
-
-        vim.keymap.set("n", "<leader>d",
-            vim.diagnostic.open_float, opts)
-
-        local client =
-            vim.lsp.get_client_by_id(event.data.client_id)
-
-        if client and
-            client:supports_method("textDocument/completion") then
-
-            vim.lsp.completion.enable(
-                true,
-                client.id,
-                event.buf,
-                { autotrigger = true }
-            )
-        end
     end,
+
 })
 
--- ----------------------------------------------------------
--- Completion
--- ----------------------------------------------------------
+-- ==========================================================
+-- General keymaps
+-- ==========================================================
 
-vim.keymap.set("i", "<C-Space>", function()
-    vim.lsp.completion.get()
-end)
+vim.keymap.set("n", "<leader>e", vim.cmd.Ex)
 
--- ----------------------------------------------------------
--- Formatting
--- ----------------------------------------------------------
-
-vim.keymap.set({ "n", "v" }, "<leader>f", function()
+vim.keymap.set("n", "<leader>f", function()
 
     require("conform").format({
         async = true,
@@ -509,121 +604,141 @@ vim.keymap.set({ "n", "v" }, "<leader>f", function()
 
 end)
 
--- ----------------------------------------------------------
--- Diagnostics navigation
--- ----------------------------------------------------------
-
-vim.keymap.set("n", "[d",
-    vim.diagnostic.goto_prev)
-
-vim.keymap.set("n", "]d",
-    vim.diagnostic.goto_next)
-
--- ----------------------------------------------------------
--- File explorer
--- ----------------------------------------------------------
-
-vim.keymap.set("n", "<leader>e",
-    vim.cmd.Ex)
-
--- ----------------------------------------------------------
--- Ansible helpers
--- ----------------------------------------------------------
-
-vim.api.nvim_create_user_command(
-    "AnsibleFiletype",
-    function()
-
-        vim.bo.filetype = "yaml.ansible"
-
-        print("Filetype set to yaml.ansible")
-
-    end,
-    {}
-)
-
--- ----------------------------------------------------------
--- Startup notification
--- ----------------------------------------------------------
-
-vim.notify("YAML / Ansible IDE loaded")
+vim.keymap.set("n", "<leader>q", vim.diagnostic.setloclist)
 
 LUA
 
 # ------------------------------------------------------------
-# 11. Install plugins and parsers
+# 9. Install plugins and Tree-sitter parsers
 # ------------------------------------------------------------
 
-log "Installing Neovim plugins..."
+echo
+echo "[8/9] Installing Neovim plugins..."
 
 nvim --headless "+Lazy! sync" +qa
 
-log "Installing Tree-sitter parsers..."
+# Verify that the lock file has been generated.
+
+if [[ ! -s "$NVIM_CONFIG/lazy-lock.json" ]]; then
+    echo "ERROR: lazy-lock.json was not generated."
+    exit 1
+fi
+
+echo
+echo "Plugin lock file:"
+echo "$NVIM_CONFIG/lazy-lock.json"
+
+echo
+echo "Checking Tree-sitter parsers..."
+
+# Install only missing or unavailable parsers.
+# JSON is intentionally excluded.
+# No forced reinstall and no interactive confirmation.
 
 nvim --headless \
-    -c "TSInstallSync yaml lua bash json" \
+    -c "lua \
+        local wanted = {'yaml', 'lua', 'bash'}; \
+        local missing = {}; \
+        for _, lang in ipairs(wanted) do \
+            local ok = pcall(vim.treesitter.language.add, lang); \
+            if not ok then \
+                table.insert(missing, lang); \
+            end; \
+        end; \
+        if #missing > 0 then \
+            print('Installing missing parsers: ' .. table.concat(missing, ', ')); \
+            vim.cmd('TSInstallSync ' .. table.concat(missing, ' ')); \
+        else \
+            print('All required Tree-sitter parsers are already available.'); \
+        end" \
+    -c "qa"
+
+# Verify required parsers.
+
+nvim --headless \
+    -c "lua \
+        for _, lang in ipairs({'yaml', 'lua', 'bash'}) do \
+            local ok, err = pcall(vim.treesitter.language.add, lang); \
+            if not ok then \
+                error('Tree-sitter parser failed: ' .. lang .. ': ' .. tostring(err)); \
+            end; \
+            print('Tree-sitter parser OK: ' .. lang); \
+        end" \
     -c "qa"
 
 # ------------------------------------------------------------
-# 12. Final validation
+# 10. Final verification
 # ------------------------------------------------------------
 
-log "Validating installation..."
-
-check_command() {
-
-    local cmd="$1"
-
-    if command -v "$cmd" >/dev/null 2>&1; then
-        echo "[OK] $cmd: $(command -v "$cmd")"
-    else
-        warn "$cmd not found"
-    fi
-}
-
-check_command nvim
-check_command node
-check_command npm
-check_command ansible
-check_command ansible-playbook
-check_command ansible-lint
-check_command yamllint
-check_command yaml-language-server
-check_command ansible-language-server
-check_command prettier
+echo
+echo "[9/9] Verifying installation..."
 
 echo
-echo "Neovim version:"
-nvim --version | head -n 2
+echo "Neovim:"
+nvim --version | head -n 1
 
 echo
-echo "Ansible version:"
-ansible --version | head -n 5
+echo "Node.js:"
+node --version
 
 echo
-echo "Installed Python tools:"
+echo "npm:"
+npm --version
+
+echo
+echo "Ansible Core:"
+ansible --version | head -n 1
+
+if [[ "$(command -v ansible)" != "$ANSIBLE_BIN_BEFORE" ]]; then
+    echo "WARNING: Ansible executable path has changed."
+fi
+
+echo
+echo "YAML Language Server:"
+command -v yaml-language-server
+
+echo
+echo "Ansible Language Server:"
+command -v ansible-language-server
+
+echo
+echo "Ansible Lint:"
 ansible-lint --version
+
+echo
+echo "Yamllint:"
 yamllint --version
 
 echo
-echo "============================================"
-echo " Neovim YAML / Ansible IDE installed"
-echo "============================================"
+echo "Prettier:"
+prettier --version
 
 echo
-echo "Run:"
+echo "lazy.nvim:"
+git -C "$LAZY_DIR" describe --tags --exact-match
+
+echo
+echo "Plugin lock file:"
+ls -lh "$NVIM_CONFIG/lazy-lock.json"
+
+echo
+echo "Installation completed successfully."
+
+echo
+echo "Start Neovim:"
 echo "  nvim"
 
 echo
-echo "Inside Neovim:"
+echo "Useful commands:"
 echo "  :checkhealth"
 echo "  :LspInfo"
-echo "  :ConformInfo"
-echo "  :TSStatus"
+echo "  :TSInstallInfo"
 
 echo
 echo "Configuration:"
-echo "  ${CONFIG_DIR}/init.lua"
+echo "  $NVIM_CONFIG/init.lua"
 
 echo
-echo "Ansible Core was not modified."
+echo "Plugin versions:"
+echo "  $NVIM_CONFIG/lazy-lock.json"
+
